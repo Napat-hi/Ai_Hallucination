@@ -19,47 +19,119 @@ text — can be used to detect hallucinated LLM answers. If an activation "expla
 
 | File | Purpose |
 |---|---|
-| `setup.ipynb` | The pipeline, single canonical notebook. Run top to bottom across two kernel sessions (see below). |
-| `load_qwen.py` | Minimal standalone script to sanity-load Qwen2.5-7B and check VRAM — useful for a quick pod smoke test before opening the notebook. |
+| `modal_app.py` | Modal orchestration. Defines the image, the persistent Volume, and one container per pipeline stage. This is the entrypoint. |
+| `nla_pipeline/datasets.py` | Dataset registry. **Swapping datasets means editing this file and nothing else.** |
+| `nla_pipeline/config.py` | Protocol constants, artifact paths, and which dataset is active. |
+| `nla_pipeline/extract.py` | Layer-20 activation capture. Dataset-agnostic: it reads specs from the registry. |
+| `nla_pipeline/verbalize.py` | SGLang AV server lifecycle, concurrent verbalization, injection-failure guard. |
+| `nla_pipeline/score.py` | AR reconstruction and the `fve_nrm` / cosine metrics. |
+| `load_qwen.py` | Standalone Qwen load + VRAM smoke test. |
+| `setup.ipynb` | Superseded RunPod notebook, kept as the record of the original two-kernel protocol. |
 
-> History note: this notebook absorbed two earlier drafts (`setup.ipynb` v0 exploratory, and
-> `setup_refactored.ipynb`). Both are superseded and were removed from the working tree; still
-> viewable via `git log` if old approaches need revisiting.
+## Running it
 
-## Environment
+Requires a [Modal](https://modal.com) account. One-time setup:
 
-Runs on a rented GPU pod (e.g. RunPod/vast.ai) with an empty `/workspace` each session — nothing
-persists between pods except what you manually download.
+```bash
+pip install modal && modal setup
+modal secret create huggingface HF_TOKEN=hf_...
+```
 
-- Combined VRAM need for Session 1 + Session 2 together exceeds 48 GB, so they **must run in
-  separate kernels** — restart the kernel between them (the notebook has an explicit cell + warning
-  for this).
-- `allenai/WildChat-1M` is gated — accept the license on HuggingFace and `huggingface-cli login`
-  (or set `HF_TOKEN`) before Session 1B.
+`allenai/WildChat-1M` is gated: accept its license on HuggingFace before running the in-dist stage.
 
-## Pipeline stages (in `setup.ipynb`)
+`natural_language_autoencoders` is a private package, not on PyPI. Copy it to
+`vendor/natural_language_autoencoders` so the image build can install it. See the block comment at
+the top of `modal_app.py` for the Volume-based alternative.
 
-1. **Phase 0 — Setup:** environment check, install deps, download Qwen + both NLA checkpoints to `/workspace/models/`.
-2. **Session 1A:** extract raw (unnormalized, float32) layer-20 activations for 200 HaluEval QA samples, last-token position. Flags samples with token position < `MIN_POSITION` (50) as immature/attention-sink features.
-3. **Session 1B:** same raw extraction over the WildChat+Ultra-FineWeb in-dist set (100 each), sampling one random token per doc at position ≥ 50, to reproduce the baseline and validate the pipeline.
-4. *(restart kernel)*
-5. **Session 2:** start the SGLang AV server (`nla-av` checkpoint), then for both datasets — verbalize activations to text (greedy decoding, temp=0, with a determinism assertion) and reconstruct back with the AR critic (`nla-ar`), computing `fve_nrm` and mean cosine similarity. Results saved to `/workspace/results_v2.json`.
+```bash
+modal run modal_app.py                    # full pipeline
+modal run modal_app.py --stage download   # weights only
+modal run modal_app.py --stage extract    # both extraction jobs, concurrent
+modal run modal_app.py --stage verbalize
+modal run modal_app.py --stage score
+```
+
+Stages hand off through the Volume, so any stage can be re-run alone without repeating the ones
+before it.
+
+## Changing the dataset
+
+Datasets are declarative specs in `nla_pipeline/datasets.py`. Extraction never names a dataset, so
+adding one touches no pipeline logic.
+
+1. Find the real column names. A wrong key otherwise fails only after a GPU has spun up:
+
+   ```bash
+   modal run modal_app.py --stage inspect --hf-path org/dataset --split validation
+   ```
+
+2. Add an `EvalDataset` to the registry. Copy the commented template in `datasets.py`:
+
+   ```python
+   MY_DATASET = EvalDataset(
+       name="my_dataset",
+       hf_path="org/dataset",
+       split="validation",
+       prompt=lambda r: f"Question: {r['question']}\nAnswer: {r['answer']}",
+       label=lambda r: int(r["is_hallucinated"]),   # 1 hallucinated, 0 truthful
+   )
+   ```
+
+   Then add it to the `EVAL_DATASETS` list.
+
+3. Run it, either per-invocation or by changing `ACTIVE_EVAL` in `config.py`:
+
+   ```bash
+   modal run modal_app.py --eval-dataset my_dataset
+   ```
+
+Artifacts are namespaced by dataset name, so switching never clobbers a previous run.
+
+To change the **in-dist mix** instead, add a `CorpusSource` and edit `INDIST_MIX`. Note that the
+`fve_nrm ≈ 0.752` target was measured on the 50/50 WildChat + Ultra-FineWeb mix, so changing the mix
+invalidates that gate unless you also update `FVE_TARGET` / `COS_TARGET`.
+
+## Pipeline stages
+
+| Stage | GPU | Work |
+|---|---|---|
+| `inspect_dataset` | none | Print a dataset's columns and a sample row. Use before registering one. |
+| `download_models` | none | Fetch Qwen + both NLA checkpoints into the Volume. Idempotent. |
+| `extract_eval` | A10G | Raw float32 layer-20 activations for the active eval dataset. |
+| `extract_indist` | A10G | Same capture over the `INDIST_MIX` corpora, one random token per doc at position >= 50. |
+| `verbalize` | A100-40GB | Boot SGLang on `nla-av`, verbalize both arms with greedy decoding. |
+| `score` | A10G | Reconstruct with `nla-ar`, compute `fve_nrm` and cosine, write `results_<dataset>.json`. |
+
+Each stage is its own container, so Qwen and SGLang never coexist. The two-kernel split the notebook
+required was an artifact of one 48 GB pod, not a protocol decision. Splitting AV from AR also means
+neither shares a card with the other.
 
 ### Key protocol decisions (why the pipeline looks the way it does)
 
 - **No L2-normalization at rest** — vectors are saved raw; scaling only happens at NLA inference time via `injection_scale`. Earlier drafts normalized at capture time, which turned out to not match the NLA training protocol.
-- **`MIN_POSITION = 50`** — early token positions carry attention-sink / immature features and are excluded from the in-dist sampling (and flagged, not silently dropped, in HaluEval).
+- **`MIN_POSITION = 50`** — early token positions carry attention-sink / immature features and are excluded from the in-dist sampling (and flagged, not silently dropped, on the eval arm).
 - **Greedy decoding (temperature=0)** for verbalization, with an explicit assertion that repeated calls are identical — otherwise fidelity metrics aren't reproducible.
-- **In-dist run before HaluEval:** if in-dist doesn't land near the ~0.752 / ~0.89 targets, treat that as a pipeline bug to fix first — don't try to interpret HaluEval numbers on top of a broken pipeline.
+- **In-dist run before the eval set:** if in-dist doesn't land near the ~0.752 / ~0.89 targets, treat that as a pipeline bug to fix first — don't try to interpret eval numbers on top of a broken pipeline.
 
 ## Outputs written to `/workspace/`
 
-- `activations_L20_raw.npy`, `labels_L20.npy`, `positions_L20.npy` — HaluEval raw activations/labels/positions
-- `activations_indist_raw.npy`, `sources_indist.npy` — in-dist raw activations (0=WildChat, 1=Ultra-FineWeb)
-- `explanations_indist.npy`, `explanations_halueval.npy` — AV verbalizations
-- `results_v2.json` — final `fve_nrm` / cosine metrics for both sets
+`<name>` is a registered dataset name (`halueval_qa` by default) or `indist`.
 
-Download these off the pod before terminating it — nothing here persists otherwise.
+- `activations_<name>_L20_raw.npy` — raw float32 layer-20 activations
+- `labels_<name>.npy`, `positions_<name>.npy` — eval arm only (1 = hallucinated, 0 = truthful)
+- `sources_<name>.npy` — in-dist only, each value indexes into `INDIST_MIX`
+- `explanations_<name>.npy` — AV verbalizations
+- `results_<eval-dataset>.json` — `fve_nrm` / cosine for both arms
+
+Namespacing by dataset means several datasets' artifacts coexist on the Volume without overwriting
+each other.
+
+These live on the `nla-workspace` Modal Volume and persist between runs. Pull them down with:
+
+```bash
+modal volume get nla-workspace results_v2.json .
+modal volume get nla-workspace 'explanations_*.npy' .
+```
 
 ## Open next steps (not yet done as of this notebook)
 

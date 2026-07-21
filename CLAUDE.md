@@ -9,46 +9,48 @@ Senior project (SIIT, Thammasat University) investigating whether **Natural Lang
 reconstructing the vector back from that text — can detect hallucinated LLM answers. Poor
 reconstruction fidelity on an activation is the hypothesized hallucination signal.
 
-The entire pipeline lives in one notebook, `setup.ipynb`. There is no application code, no test
-suite, and no build step — this is a research/experiment repo meant to be run top-to-bottom on a
-rented GPU pod (RunPod/vast.ai) with an empty `/workspace` each session.
+The pipeline runs on **Modal** (`modal_app.py` + `nla_pipeline/`). There is no application code, no
+test suite, and no build step: this is a research/experiment repo. `setup.ipynb` is the superseded
+RunPod version, kept as the record of the original two-kernel protocol.
 
 ## Running the pipeline
 
-There's no local dev loop — everything runs on a GPU pod (48GB VRAM class, e.g. RTX A6000) via
-Jupyter. `setup.ipynb` runs in **two separate kernel sessions** because Session 1 (Qwen) + Session 2
-(SGLang AV + AR) together exceed 48GB combined:
+There is no local dev loop. Nothing runs on a laptop: every stage is a Modal container.
 
-1. **Phase 0 (same kernel as Session 1):** install deps, download models.
-   ```bash
-   pip install huggingface_hub accelerate datasets scikit-learn tqdm -q
-   pip install "sglang[all]==0.5.6" -q
-   cd /workspace/natural_language_autoencoders && pip install -e . -q
-   ```
-   `allenai/WildChat-1M` is gated — `huggingface-cli login` (or set `HF_TOKEN`) before Session 1B.
+```bash
+pip install modal && modal setup
+modal secret create huggingface HF_TOKEN=hf_...      # WildChat-1M is gated
 
-2. **Session 1A/1B (first kernel):** load Qwen2.5-7B-Instruct, extract raw layer-20 activations for
-   HaluEval QA and the in-distribution set. **Restart the kernel** after this (there's an explicit
-   cell that frees Qwen and warns to restart) before moving to Session 2.
+modal run modal_app.py                    # full pipeline
+modal run modal_app.py --stage verbalize  # or any single stage
+```
 
-3. **Session 2 (fresh kernel):** start the SGLang AV server first, then run the verbalization/scoring
-   cells:
-   ```bash
-   python -m sglang.launch_server \
-       --model /workspace/models/nla-av \
-       --port 30000 \
-       --mem-fraction-static 0.85 \
-       --disable-radix-cache \
-       --trust-remote-code \
-       --dtype bfloat16
-   ```
-   Wait for the server-ready message before running client cells against `http://127.0.0.1:30000`.
+Five stages, one container each, handing off through a persistent Volume mounted at `/workspace`:
 
-- `load_qwen.py` is a standalone smoke test — run it alone to sanity-check Qwen loads and check VRAM
-  before opening the full notebook.
-- All outputs are written to `/workspace/` (`.npy` activations/labels/positions, `explanations_*.npy`,
-  `results_v2.json`) and must be downloaded before terminating the pod — nothing in `/workspace`
-  persists otherwise, and `.gitignore` deliberately excludes these files from the repo.
+| Stage | GPU | Work |
+|---|---|---|
+| `inspect_dataset` | none | Print a dataset's columns + sample row. Precedes registering a new one. |
+| `download_models` | none | Qwen + both NLA checkpoints into the Volume. Idempotent. |
+| `extract_eval` | A10G | Raw layer-20 activations for the active eval dataset. |
+| `extract_indist` | A10G | Same capture over the `INDIST_MIX` corpora. |
+| `verbalize` | A100-40GB | SGLang on `nla-av`, greedy decoding, both arms. |
+| `score` | A10G | `nla-ar` reconstruction, `fve_nrm` + cosine, writes `results_<dataset>.json`. |
+
+Consequences of the container split, all deliberate:
+
+- **The two-kernel session split is gone.** It was an artifact of one 48GB pod holding Qwen and
+  SGLang at once, not a protocol decision. Do not reintroduce it.
+- **AV and AR are separate stages.** Neither shares a card, so `--mem-fraction-static 0.85` is safe
+  now. On the pod it was an OOM risk against a co-resident 7B critic.
+- **Weights download once.** The Volume persists, unlike the pod's empty `/workspace` each session.
+- **Verbalization is concurrent** (`AV_CONCURRENCY`, default 16). Safe because it is HTTP to a
+  separate SGLang process. Extraction stays single-threaded: its forward hook holds per-instance
+  state that concurrent calls would race on, and CUDA serializes anyway.
+
+`load_qwen.py` is a standalone smoke test for checking Qwen loads and VRAM.
+
+Artifacts land on the `nla-workspace` Volume and persist between runs. Retrieve with
+`modal volume get nla-workspace <file> .`. `.gitignore` deliberately excludes them from the repo.
 
 ## Architecture / protocol decisions
 
@@ -69,12 +71,34 @@ Jupyter. `setup.ipynb` runs in **two separate kernel sessions** because Session 
   those targets, treat that as a pipeline bug to fix *first* — don't interpret HaluEval numbers on
   top of a pipeline that hasn't been validated. Conversely, HaluEval scoring *below* the in-dist
   target is an expected distribution-shift finding, not a bug.
-- **`natural_language_autoencoders` is a vendored dependency**, expected at
-  `/workspace/natural_language_autoencoders` (installed editable in Phase 0) — `NLAClient` /
-  `NLACritic` / `nla_inference.py` come from there, not from this repo.
-- Notebook history: `setup.ipynb` is the single canonical, current version — it absorbed and
-  superseded two earlier drafts (an exploratory v0 and `setup_refactored.ipynb`), both removed from
-  the working tree but recoverable via `git log` if an old approach needs revisiting.
+- **Datasets are declarative, in `nla_pipeline/datasets.py`.** `EvalDataset` (labeled arm) and
+  `CorpusSource` (in-dist arm) carry the HF coordinates plus `prompt` / `label` / `text` lambdas.
+  `extract.py` never names a dataset, so adding one touches no pipeline logic: register a spec, then
+  either set `ACTIVE_EVAL` in config or pass `--eval-dataset <name>`. Use
+  `--stage inspect --hf-path <repo>` to get real column names first; a wrong key otherwise fails
+  only after a GPU has spun up.
+- **Artifacts are namespaced by dataset name** (`activations_<name>_L20_raw.npy`,
+  `explanations_<name>.npy`, `results_<eval>.json`). Switching datasets cannot clobber a prior run,
+  and several datasets' outputs coexist on the Volume. Note these filenames differ from the
+  notebook's flat `activations_L20_raw.npy` / `labels_L20.npy` / `results_v2.json`.
+- **Changing `INDIST_MIX` invalidates the reproduction gate.** The `fve_nrm ≈ 0.752` target was
+  measured on the 50/50 WildChat + Ultra-FineWeb mix. Update `FVE_TARGET` / `COS_TARGET` alongside
+  it or the self-check becomes meaningless.
+- **Remaining constants live in `nla_pipeline/config.py`**, not scattered through the stages.
+  `FILTER_EVAL_BELOW_MIN_POSITION` is the one open knob: it defaults to `False` to match the
+  notebook's flag-don't-drop behaviour, but the in-dist sampler enforces `MIN_POSITION` strictly, so
+  the two arms are not position-matched until it is `True`.
+- **`natural_language_autoencoders` is a vendored private dependency** supplying `NLAClient`,
+  `NLACritic`, and `nla_inference.py` (repo root, not inside `nla/`). It is not on PyPI. Keep a copy
+  at `vendor/natural_language_autoencoders`; the image bakes it in and installs it editable at
+  `/opt/nla`. See the block comment at the top of `modal_app.py` for the Volume-based alternative.
+- **Known injection failure signature:** `nla/injection.py` documents that if injection misses the
+  marked position, the model emits the literal ㊗ character and outputs Chinese.
+  `verbalize.check_injection_health` samples for this and warns, so it fails loudly instead of
+  producing plausible-looking garbage metrics.
+- History: `setup.ipynb` is the superseded RunPod notebook, kept as the record of the two-kernel
+  protocol. It absorbed two earlier drafts (an exploratory v0 and `setup_refactored.ipynb`), both
+  removed from the working tree but recoverable via `git log`.
 
 ## Open next steps (as of the current notebook)
 

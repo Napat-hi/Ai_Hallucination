@@ -24,6 +24,12 @@ hf_cache/
 explanations*.npy
 results*.json
 
+# Vendored private dependency (natural_language_autoencoders), see modal_app.py
+vendor/
+
+# Modal
+.modal/
+
 # OS / editor
 .DS_Store
 Thumbs.db
