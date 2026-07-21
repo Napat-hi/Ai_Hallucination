@@ -1,0 +1,42 @@
+# ============================================================
+# Ai_Hallucination — Interpretable Hallucination Detection (NLA)
+# Base model: Qwen2.5-7B-Instruct | Pipeline: activation extraction
+# -> linear probe -> NLA verbalization (AV) -> AR reconstruction scoring
+# ------------------------------------------------------------
+# NOTE: torch and sglang already ship with the RunPod Docker image
+#       (lmsysorg/sglang). Listed here to document the full stack
+#       for teammates who reproduce outside that exact image.
+# ============================================================
+
+# ---- Core deep learning ----
+torch                      # ships with the sglang Docker image (CUDA build)
+transformers>=4.45.0       # Qwen2.5 (Qwen2ForCausalLM) support
+accelerate>=0.34.0         # large-model loading / device_map
+safetensors>=0.4.5
+
+# ---- NLA serving / runtime ----
+sglang[all]==0.5.6         # pinned; image ships 0.4.6.post3, install this on top
+requests>=2.31.0           # NLAClient -> SGLang HTTP endpoint (port 30000)
+
+# ---- Datasets & HuggingFace Hub ----
+datasets>=2.20.0           # HaluEval QA, WildChat-1M, Ultra-FineWeb
+huggingface_hub>=0.24.0    # snapshot_download + backup to hallucination-results
+hf_transfer                # HF_HUB_ENABLE_HF_TRANSFER=1 (cell-6, parallel model downloads)
+
+# ---- Data & config ----
+numpy>=1.26,<2.0           # .npy activations; <2.0 avoids ABI break w/ pinned torch
+pandas>=2.0.0
+pyyaml>=6.0                # read nla_meta.yaml sidecar (injection_scale, templates)
+
+# ---- Analysis / probe ----
+scikit-learn>=1.3.0        # linear probe accuracy
+scipy>=1.11.0              # cosine similarity / numerical
+matplotlib>=3.7.0          # theme comparison + thesis plots
+
+# ---- Utilities ----
+tqdm>=4.66.0
+
+# ---- Optional (uncomment if needed) ----
+# sentencepiece           # only if a Qwen tokenizer path complains
+# ipykernel               # running setup_v2.ipynb in a fresh kernel
+# notebook                # local Jupyter (RunPod image usually has it)
