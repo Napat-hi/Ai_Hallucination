@@ -69,19 +69,35 @@ Jupyter. `setup.ipynb` runs in **two separate kernel sessions** because Session 
   those targets, treat that as a pipeline bug to fix *first* — don't interpret HaluEval numbers on
   top of a pipeline that hasn't been validated. Conversely, HaluEval scoring *below* the in-dist
   target is an expected distribution-shift finding, not a bug.
-- **`natural_language_autoencoders` is a vendored dependency**, expected at
-  `/workspace/natural_language_autoencoders` (installed editable in Phase 0) — `NLAClient` /
-  `NLACritic` / `nla_inference.py` come from there, not from this repo.
+- **`natural_language_autoencoders` is a vendored dependency**, cloned from
+  [`github.com/kitft/natural_language_autoencoders`](https://github.com/kitft/natural_language_autoencoders)
+  to `/workspace/natural_language_autoencoders` (installed editable in Phase 0) — `NLAClient` /
+  `NLACritic` / `nla_inference.py` come from there, not from this repo. `docs/inference.md` in that
+  repo is the source of truth for the exact `fve_nrm` formula and known footguns — trust it over any
+  third-party summary of the protocol.
+- **`fve_nrm` formula, confirmed against the vendored repo's own docs:**
+  `fve = 1 - ((pred_n - gold_n)**2).mean() / ((gold_n - mu)**2).mean()`, where `pred_n`/`gold_n` are
+  both L2-normalized to `mse_scale` (√d ≈ 59.87) and `mu = gold_n.mean(dim=0)` is **not**
+  re-normalized back onto the unit sphere. There is no separate "paraphrase ceiling" division step —
+  an earlier draft of this doc assumed one existed (sourced from an unverified third-party PDF) and
+  it does not. `evaluate()` in `setup.ipynb` already implements this formula directly; its `fve` *is*
+  `fve_nrm`, full stop. `injection_scale = 150` (matches the notebook's diagnostic hint).
 - Notebook history: `setup.ipynb` is the single canonical, current version — it absorbed and
   superseded two earlier drafts (an exploratory v0 and `setup_refactored.ipynb`), both removed from
   the working tree but recoverable via `git log` if an old approach needs revisiting.
 
 ## Open next steps (as of the current notebook)
 
-1. **Paraphrase-ceiling correction** — raw FVE needs dividing by a ceiling constant from
-   `natural_language_autoencoders`'s own eval scripts before it's comparable to the reported 0.752;
-   that constant still needs to be located and applied.
+1. **Doc-level leakage tracking — tracked, not provably solved.** Session 1B now tags every in-dist
+   sample with a `doc_id` (source ID field, or a content hash if none exists) and refuses to
+   resample the same doc within a run (`doc_ids_indist.npy`). This only guarantees no duplicates
+   *within our own sample* — neither WildChat-1M/Ultra-FineWeb nor the `kitft` NLA checkpoints
+   publish the training split's doc IDs, so non-overlap with the NLA's actual training data is
+   still unverified. Document this as a limitation, not a solved problem.
 2. **Semantic theme analysis** — compare AV verbalization language/themes between hallucinated vs.
    truthful HaluEval samples using `explanations_halueval.npy` + `labels_L20.npy`.
 3. **Bonus comparison** — re-run the linear probe on raw (non-normalized) layer-20 vectors against
    whatever normalized-vector probe result exists from earlier work.
+
+Resolved: paraphrase-ceiling correction — turned out not to exist as a real step (see above); the
+notebook's `evaluate()` already computes the real `fve_nrm` directly.

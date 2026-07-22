@@ -23,6 +23,8 @@ hf_cache/
 *.npy
 explanations*.npy
 results*.json
+*.zip
+*.log
 
 # OS / editor
 .DS_Store
